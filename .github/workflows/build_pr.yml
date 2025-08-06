@@ -69,7 +69,7 @@ jobs:
           mkdir -p blueos
           cd blueos
           ## 这行具体改一下
-          repo init -u git@github.com:mogxtest/manifests.git -b main -m manifest.xml
+          repo init -u https://github.com/mogxtest/manifests.git -b main -m manifest.xml
           repo sync -j8
  
       - name: Apply PR changes
