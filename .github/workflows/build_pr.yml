@@ -1,176 +1,247 @@
-name: Orchestrator CI
+name: BlueOS Standalone CI
  
 on:
-  repository_dispatch:
-    types: [single-repo-build, multi-repo-build]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+ 
+concurrency:
+  group: ${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
  
 jobs:
-  handle-build:
+  build-system:
+    # 仅在包含"start build"且PR/Issue开放时触发
+    if: |
+      contains(github.event.comment.body, 'start build') &&
+      (
+        (github.event.issue.state == 'open') ||
+        (github.event.pull_request.state == 'open')
+      )
     runs-on: ubuntu-latest
+    env:
+      ORCHESTRATOR_TOKEN: ${{ secrets.REPO_ORCHESTRATOR_TOKEN01 }}
+      MANIFEST_REPO: https://github.com/mogxtest/manifests
       
     steps:
-      - name: Parse request
-        id: parse-request
+      # 步骤1: 初始设置和状态通知
+      - name: Initialize and notify
+        id: init
         run: |
-          # 统一payload格式
-          PAYLOAD='${{ toJSON(github.event.client_payload) }}'
-          echo $PAYLOAD
+          # 确定触发器类型
+          if [ -n "${{ github.event.issue.pull_request }}" ]; then
+            echo "trigger_type=pr" >> $GITHUB_OUTPUT
+            echo "source_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "trigger_type=issue" >> $GITHUB_OUTPUT
+            echo "source_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
            
-          # 确保总是有repos数组
-          if ! echo "$PAYLOAD" | jq -e '.repos' > /dev/null; then
-            # 旧格式转换
-            REPOS=$(jq -n --arg repo "$(echo "$PAYLOAD" | jq -r '.source_repo | split("/")[1]')" \
-                         --arg owner "$(echo "$PAYLOAD" | jq -r '.source_repo | split("/")[0]')" \
-                         --arg pr "$(echo "$PAYLOAD" | jq -r '.pr_number')" \
-                         '{repos: [{owner: $owner, repo: $repo, pr: $pr|tonumber}]}')
-            PAYLOAD=$(echo "$PAYLOAD" | jq --argjson repos "$REPOS" '. + $repos')
+          # 构建状态链接
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            
+          # 保存运行URL
+          echo "run_url=$RUN_URL" >> $GITHUB_OUTPUT
+ 
+      # 步骤2: 提取PR链接
+      - name: Extract PR links
+        id: extract-prs
+        run: |
+          # 提取所有PR链接
+          PR_LINKS=$(echo "${{ github.event.comment.body }}" | grep -oE 'https://github.com/[^/]+/[^/]+/pull/[0-9]+' | sort | uniq)
+          echo "PR_LINKS:"
+          echo "$PR_LINKS"
+       
+          # 如果没有链接，添加当前PR
+          if [ -z "$PR_LINKS" ] && [ -n "${{ github.event.issue.pull_request }}" ]; then
+            CURRENT_PR="https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}"
+            echo "CURRENT_PR"
+            echo $CURRENT_PR
+            PR_LINKS=$CURRENT_PR
           fi
           
-          echo $PAYLOAD
-          echo "$PAYLOAD" > payload.json
-          echo "Payload content:"
-          cat payload.json
+          # 转换为JSON数组并用单行格式输出
+          PR_LINKS_ARRAY=$(echo "$PR_LINKS" | jq -R -s 'split("\n") | map(select(. != ""))')
+          echo "PR_LINKS_ARRAY=${PR_LINKS_ARRAY}"
+          pr_links_formatted=$(echo "$PR_LINKS_ARRAY" | jq '. | join(",")')
+          # echo "pr_links=[${pr_links_formatted}]" >> $GITHUB_OUTPUT
+          # echo "pr_links=${PR_LINKS_ARRAY}" >> $GITHUB_OUTPUT
+          pr_links=$(echo "$PR_LINKS_ARRAY" | jq -c '.')
+          echo "pr_links=${pr_links}" >> $GITHUB_OUTPUT
+          echo "pr_links=${pr_links}"
           
-          # 验证所有PR状态
-          jq -c '.repos[]' payload.json | while read repo_data; do
-            owner=$(echo "$repo_data" | jq -r '.owner')
-            repo=$(echo "$repo_data" | jq -r '.repo')
-            pr=$(echo "$repo_data" | jq -r '.pr')
+          echo "Detected PRs:"
+          echo "$PR_LINKS"
+ 
+      # 步骤3: 验证PR状态
+      - name: Validate PRs
+        run: |
+          # 安装必要工具
+          PR_LINKS='${{ steps.extract-prs.outputs.pr_links }}'
+          
+          # 验证每个PR状态
+          INVALID_COUNT=0
+          echo "$PR_LINKS" | jq -r '.[]' | while read link; do
+            # 解析PR信息
+            PARTS=($(echo "$link" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)|\1 \2 \3|'))
+            OWNER=${PARTS[0]}
+            REPO=${PARTS[1]}
+            PR_NUM=${PARTS[2]}
             
-            echo "Validating $owner/$repo PR#$pr"
+            echo "Validating PR: $OWNER/$REPO#$PR_NUM"
             
-            # 检查PR状态
-            PR_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.REPO_ORCHESTRATOR_TOKEN01 }}" \
-              "https://api.github.com/repos/$owner/$repo/pulls/$pr")
-            echo $PR_JSON
+            # 获取PR详细信息
+            PR_JSON=$(curl -s -H "Authorization: Bearer $ORCHESTRATOR_TOKEN" \
+              "https://api.github.com/repos/$OWNER/$REPO/pulls/$PR_NUM")
             
             state=$(echo "$PR_JSON" | jq -r '.state')
+            merged=$(echo "$PR_JSON" | jq -r '.merged')
             mergeable=$(echo "$PR_JSON" | jq -r '.mergeable')
+            echo "PR_JSON=${PR_JSON} state=${state}  merged=${merged} mergeable=${mergeable}"
             
-            if [ "$state" != "open" ] || [ "$mergeable" != "true" ]; then
-              echo "::error::PR $owner/$repo#$pr is not buildable (state: $state, mergeable: $mergeable)"
-              exit 1
+            if [ "$state" != "open" ] || [ "$merged" == "true" ] || [ "$mergeable" != "true" ]; then
+              echo "::error::PR $OWNER/$REPO#$PR_NUM is not buildable"
+              echo "::error::State: $state, Merged: $merged, Mergeable: $mergeable"
+              INVALID_COUNT=$((INVALID_COUNT+1))
             fi
           done
+          
+          if [ $INVALID_COUNT -gt 0 ]; then
+            echo "::error::Found $INVALID_COUNT invalid PRs"
+            exit 1
+          fi
  
-      - name: Setup environment
+      # 步骤4: 设置构建环境
+      - name: Setup build environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y repo git-lfs python3-pip
+          sudo apt-get install -y repo git-lfs 
           pip3 install PyGithub
            
-          # 配置git
           git config --global user.name "BlueOS CI Bot"
-          git config --global user.email "buleos_ci@vivo.com"
+          git config --global user.email "ci@blueos.org"
           git config --global advice.detachedHead false
  
+      # 步骤5: 初始化仓库
       - name: Initialize repo workspace
         run: |
           mkdir -p blueos
           cd blueos
-          ## 这行具体改一下
-          repo init -u https://github.com/mogxtest/manifests.git -b main -m manifest.xml
+          repo init -u $MANIFEST_REPO -m manifest.xml
+           
+          # 
           repo sync -j8
  
+      # 步骤6: 应用PR变更
       - name: Apply PR changes
         run: |
           cd blueos
-          repo forall -c 'git checkout main ; git pull'
+           
+          # 进度通知
+          RUN_URL='${{ steps.init.outputs.run_url }}'
           
-          # 处理每个PR
-          jq -c '.repos[]' ../payload.json | while read repo_data; do
-            owner=$(echo "$repo_data" | jq -r '.owner')
-            repo=$(echo "$repo_data" | jq -r '.repo')
-            pr=$(echo "$repo_data" | jq -r '.pr')
-            repo_path="$repo"
+          # 应用每个PR
+          PR_LINKS='${{ steps.extract-prs.outputs.pr_links }}'
+          echo "$PR_LINKS" | jq -r '.[]' | while read link; do
+            PARTS=($(echo "$link" | sed -E 's|https://github.com/([^/]+)/([^/]+)/pull/([0-9]+)|\1 \2 \3|'))
+            echo ${PARTS}
+            OWNER=${PARTS[0]}
+            REPO=${PARTS[1]}
+            PR_NUM=${PARTS[2]}
             
-            echo "Processing $repo_path PR#$pr"
+            echo "Applying PR: $OWNER/$REPO#$PR_NUM"
             
             # 查找项目路径
-            project_path=$(repo list | grep "$repo_path" | awk '{print $1}')
+            project_path=$(repo list | grep ": $REPO$" | awk '{print $1}')
             
             if [ -z "$project_path" ]; then
-              echo "::error::Project path not found for $repo_path"
+              echo "::error::Project path not found for $OWNER/$REPO"
               exit 1
             fi
             
-            # 进入项目目录
             cd "$project_path"
             
             # 获取PR详细信息
-            PR_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.REPO_ORCHESTRATOR_TOKEN01 }}" \
-              "https://api.github.com/repos/$owner/$repo/pulls/$pr")
-              
-            PR_HEAD_OWNER=$(echo "$PR_JSON" | jq -r '.head.repo.owner.login')
-            PR_HEAD_REPO=$(echo "$PR_JSON" | jq -r '.head.repo.name')
-            PR_HEAD_REF=$(echo "$PR_JSON" | jq -r '.head.ref')
-            PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
-            echo "PR head: $PR_HEAD_OWNER/$PR_HEAD_REPO@$PR_HEAD_REF ($PR_HEAD_SHA)"
+            PR_JSON=$(curl -s -H "Authorization: Bearer $ORCHESTRATOR_TOKEN" \
+              "https://api.github.com/repos/$OWNER/$REPO/pulls/$PR_NUM")
             
-            # 添加远程仓库
-            git remote add pr-remote "https://github.com/$PR_HEAD_OWNER/$PR_HEAD_REPO.git" || true
-            git fetch pr-remote
+            head_owner=$(echo "$PR_JSON" | jq -r '.head.repo.owner.login')
+            head_repo=$(echo "$PR_JSON" | jq -r '.head.repo.name')
+            head_ref=$(echo "$PR_JSON" | jq -r '.head.ref')
+            head_sha=$(echo "$PR_JSON" | jq -r '.head.sha')
+            base_ref=$(echo "$PR_JSON" | jq -r '.base.ref')
+            
+            # 添加开发者远程仓库
+            git remote add pr-remote "https://github.com/$head_owner/$head_repo.git" || true
+            git fetch pr-remote "${head_sha}"
             
             # 确保主线最新
-            MAIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
-            git checkout $MAIN_BRANCH
-            git pull origin $MAIN_BRANCH
+            git fetch origin
+            git checkout -B ci-base "origin/$base_ref"
             
-            # 创建并切换到PR分支
-            git checkout -b "pr-$pr"
-            git merge --no-ff "$PR_HEAD_SHA" -m "Merge PR#$pr for CI testing"
+            # 创建PR分支并合并
+            git checkout -b "pr-$PR_NUM" "$head_sha"
+            git merge ci-base -m "Merge base into PR for CI testing"
+            
             if [ $? -ne 0 ]; then
-              echo "::error::Merge conflict in $project_path for PR $pr"
+              echo "::error::Merge conflict in $project_path for PR $PR_NUM"
               exit 1
             fi
             
-            echo "Applied PR $pr to $project_path"
-            echo "Applied PR $pr from $PR_HEAD_OWNER/$PR_HEAD_REPO"
-            
-            # 返回到repo根目录
             cd - >/dev/null
           done
-          
  
-      - name: Run CI validation
+      # 步骤7: 执行构建
+      - name: Build BlueOS
         run: |
           cd blueos
-          ### 执行CI
-          echo "start CI"
-
-         
-        # 使用超时防止卡死
+           
+          # 进度通知
+          RUN_URL='${{ steps.init.outputs.run_url }}'
+          echo $RUN_URL
+          tree .
+        
+        # 超时设置
         timeout-minutes: 120
  
-      - name: Report results
-        # env:
-        #   GITHUB_TOKEN: ${{ secrets.REPO_ORCHESTRATOR_TOKEN01 }}
+      # 步骤8: 处理结果
+      - name: Handle build result
+        id: build-result
         run: |
-          cd blueos
-          CI_STATUS=$([ $? -eq 0 ] && echo "success" || echo "failure")
-           
-          jq -c '.repos[]' ../payload.json | while read repo_data; do
-            owner=$(echo "$repo_data" | jq -r '.owner')
-            repo=$(echo "$repo_data" | jq -r '.repo')
-            pr=$(echo "$repo_data" | jq -r '.pr')
+          if [ $? -eq 0 ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=BlueOS 构建成功" >> $GITHUB_OUTPUT
+            echo "label=build-success"  >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=BlueOS 构建失败" >> $GITHUB_OUTPUT
+            echo "label=build-failed"  >> $GITHUB_OUTPUT
+          fi
+ 
+      # 步骤9: 发送最终通知
+      - name: Final notification
+        env:
+          GITHUB_TOKEN: ${{ secrets.REPO_ORCHESTRATOR_TOKEN01 }}
+        run: |
+          # 构建结果参数
+          STATUS='${{ steps.build-result.outputs.status }}'
+          MESSAGE='${{ steps.build-result.outputs.message }}'
+          LABEL='${{ steps.build-result.outputs.label }}'
+          RUN_URL='${{ steps.init.outputs.run_url }}'
             
-            # 获取项目路径和当前SHA
-            project_path=$(repo list | grep "$repo" | awk '{print $1}')
-            cd "$project_path"
-            COMMIT_SHA=$(git rev-parse HEAD)
-            cd - >/dev/null
+          # 添加结果标签
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/${{ steps.init.outputs.source_number }}/labels" \
+            -d "{\"labels\":[\"$LABEL\"]}"
             
-            # # 发送状态报告
-            # curl -s -X POST \
-            #   -H "Authorization: Bearer $GITHUB_TOKEN" \
-            #   -H "Accept: application/vnd.github.v3+json" \
-            #   "https://api.github.com/repos/$owner/$repo/statuses/$COMMIT_SHA" \
-            #   -d '{
-            #     "state": "'$CI_STATUS'",
-            #     "target_url": "'$GITHUB_SERVER_URL'/'$GITHUB_REPOSITORY'/actions/runs/'$GITHUB_RUN_ID'",
-            #     "description": "BlueOS CI '${CI_STATUS^}'",
-            #     "context": "blueos-ci"
-            #   }'
-            
-            echo "Reported $CI_STATUS status for $owner/$repo PR#$pr"
-          done
+          # 发送结果评论
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/${{ steps.init.outputs.source_number }}/comments" \
+            -d "{
+              \"body\": \"$MESSAGE\\n\\n构建日志: $RUN_URL\"
+            }"
